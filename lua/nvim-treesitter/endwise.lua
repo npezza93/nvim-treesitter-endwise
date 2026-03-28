@@ -37,6 +37,128 @@ local function strip_leading_whitespace(line)
     end
 end
 
+local function find_child(node, wanted_type)
+    for child in node:iter_children() do
+        if child:type() == wanted_type then
+            return child
+        end
+    end
+end
+
+local function find_smallest_matching_node(node, row, col, wanted)
+    local node_range = { node:range() }
+    if not point_in_range(row, col, node_range) then
+        return nil
+    end
+
+    for child in node:iter_children() do
+        local match = find_smallest_matching_node(child, row, col, wanted)
+        if match then
+            return match
+        end
+    end
+
+    if wanted[node:type()] then
+        return node
+    end
+end
+
+local function unpack_match(match, query)
+    local indent_node, cursor_node, endable_node
+    for id, node in pairs(match) do
+        if type(node) == 'table' then
+            node = node[#node]
+        end
+
+        if query.captures[id] == 'indent' then
+            indent_node = node
+        elseif query.captures[id] == 'cursor' then
+            cursor_node = node
+        elseif query.captures[id] == 'endable' then
+            endable_node = node
+        end
+    end
+
+    return indent_node, cursor_node, endable_node
+end
+
+local function build_end_text(metadata, source)
+    local end_text = metadata.endwise_end_text
+    if metadata.endwise_end_suffix then
+        local suffix = vim.treesitter.get_node_text(metadata.endwise_end_suffix, source)
+        local s, e = vim.regex(metadata.endwise_end_suffix_pattern):match_str(suffix)
+        if s then
+            suffix = string.sub(suffix, s + 1, e)
+        end
+        end_text = end_text .. suffix
+    end
+
+    return end_text
+end
+
+local function last_non_whitespace_pos(text)
+    local lines = vim.split(text, '\n', { plain = true })
+    for row = #lines, 1, -1 do
+        local stripped = lines[row]:match('^(.*%S)')
+        if stripped then
+            return row - 1, #stripped - 1
+        end
+    end
+
+    return 0, 0
+end
+
+local function string_lacks_end(node, end_text)
+    local end_node = node:child(node:child_count() - 1)
+    if end_node == nil then
+        return true
+    end
+    if end_node:type() ~= end_text then
+        return false
+    end
+
+    return end_node:missing()
+end
+
+local function lua_pesc(text)
+    return (text:gsub('([^%w])', '%%%1'))
+end
+
+local function erb_end_text(directive, end_text, bufnr)
+    local first = directive:child(0)
+    local last = directive:child(directive:child_count() - 1)
+    local open_text = first and vim.treesitter.get_node_text(first, bufnr) or '<%'
+    local close_text = last and vim.treesitter.get_node_text(last, bufnr) or '%>'
+    open_text = open_text:gsub('=', '')
+    return open_text .. ' ' .. end_text .. ' ' .. close_text
+end
+
+local function erb_has_closing_directive_after(directive, end_text, bufnr)
+    local directive_range = { directive:range() }
+    local start_row = directive_range[1] + 1
+    local indentation = strip_leading_whitespace(vim.fn.getline(start_row))
+    local pattern = '^%s*<%%[-_]?%s*' .. lua_pesc(end_text) .. '%s*[-_]?%%>%s*$'
+    local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+    for lnum = start_row + 1, line_count do
+        local line = vim.fn.getline(lnum)
+        if not line:match('^%s*$') then
+            local current_indent = strip_leading_whitespace(line)
+            if #current_indent < #indentation then
+                return false
+            end
+            if current_indent == indentation and line:match(pattern) then
+                return true
+            end
+            if current_indent == indentation then
+                return false
+            end
+        end
+    end
+
+    return false
+end
+
 local function lacks_end(node, end_text)
     local end_node = node:child(node:child_count() - 1)
     if end_node == nil then
@@ -98,8 +220,72 @@ local function add_end_node(indent_node_range, endable_node_range, end_text, shi
     vim.fn.cursor(crow, #cursor_indentation + 1)
 end
 
+local function endwise_embedded_template(bufnr, row, col)
+    local parser = vim.treesitter.get_parser(bufnr, 'embedded_template', { error = false })
+    if not parser then
+        return false
+    end
+
+    local tree = parser:parse()[1]
+    if not tree then
+        return false
+    end
+
+    local root = tree:root()
+    if not root then
+        return false
+    end
+
+    local directive = find_smallest_matching_node(root, row, col, {
+        directive = true,
+        output_directive = true,
+    })
+    if not directive then
+        return false
+    end
+
+    local code_node = find_child(directive, 'code')
+    if not code_node then
+        return false
+    end
+
+    local code = vim.trim(vim.treesitter.get_node_text(code_node, bufnr))
+    if code == '' then
+        return false
+    end
+
+    local ruby_query = vim.treesitter.query.get('ruby', 'endwise')
+    if not ruby_query then
+        return false
+    end
+
+    local ruby_parser = vim.treesitter.get_string_parser(code, 'ruby')
+    local ruby_root = ruby_parser:parse()[1]:root()
+    local ruby_row, ruby_col = last_non_whitespace_pos(code)
+
+    for _, match, metadata in ruby_query:iter_matches(ruby_root, code, 0, -1, { all = true }) do
+        local _, cursor_node, endable_node = unpack_match(match, ruby_query)
+        if cursor_node and point_in_range(ruby_row, ruby_col, { cursor_node:range() }) then
+            local end_node_type = metadata.endwise_end_node_type or metadata.endwise_end_text
+            if (not endable_node or string_lacks_end(endable_node, end_node_type)) then
+                local inner_end_text = build_end_text(metadata, code)
+                if erb_has_closing_directive_after(directive, inner_end_text, bufnr) then
+                    return false
+                end
+                add_end_node({ directive:range() }, nil, erb_end_text(directive, inner_end_text, bufnr), metadata.endwise_shiftcount)
+                return true
+            end
+        end
+    end
+
+    return false
+end
+
 local function endwise(bufnr)
     local lang = vim.treesitter.language.get_lang(vim.bo[bufnr].filetype or '')
+    if lang == 'eruby' or lang == 'erb' then
+        lang = 'embedded_template'
+    end
     if not lang then
         return
     end
@@ -113,6 +299,10 @@ local function endwise(bufnr)
     local row, col = unpack(vim.fn.searchpos('\\S', 'nbW'))
     row = row - 1
     col = col - 1
+
+    if lang == 'embedded_template' and endwise_embedded_template(bufnr, row, col) then
+        return
+    end
 
     local lang_tree = parser:language_for_range({ row, col, row, col })
     lang = lang_tree:lang()
@@ -144,35 +334,14 @@ local function endwise(bufnr)
     local range = { root:range() }
 
     for _, match, metadata in query:iter_matches(root, bufnr, range[1], range[3] + 1, { all = true }) do
-        local indent_node, cursor_node, endable_node
-        for id, node in pairs(match) do
-            if type(node) == 'table' then
-                node = node[#node]
-            end
-
-            if query.captures[id] == 'indent' then
-                indent_node = node
-            elseif query.captures[id] == 'cursor' then
-                cursor_node = node
-            elseif query.captures[id] == 'endable' then
-                endable_node = node
-            end
-        end
+        local indent_node, cursor_node, endable_node = unpack_match(match, query)
 
         local indent_node_range = { indent_node:range() }
         local cursor_node_range = { cursor_node:range() }
         if point_in_range(row, col, cursor_node_range) then
             local end_node_type = metadata.endwise_end_node_type or metadata.endwise_end_text
             if not endable_node or lacks_end(endable_node, end_node_type) then
-                local end_text = metadata.endwise_end_text
-                if metadata.endwise_end_suffix then
-                    local suffix = text_for_range({ metadata.endwise_end_suffix:range() })
-                    local s, e = vim.regex(metadata.endwise_end_suffix_pattern):match_str(suffix)
-                    if s then
-                        suffix = string.sub(suffix, s + 1, e)
-                    end
-                    end_text = end_text .. suffix
-                end
+                local end_text = build_end_text(metadata, bufnr)
                 local endable_node_range = endable_node and { endable_node:range() } or nil
                 add_end_node(indent_node_range, endable_node_range, end_text, metadata.endwise_shiftcount)
                 return

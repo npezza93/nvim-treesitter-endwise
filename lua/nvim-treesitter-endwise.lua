@@ -38,6 +38,10 @@ function M.is_supported(lang)
             return false
         end
 
+        if nested_lang == 'embedded_template' or nested_lang == 'eruby' or nested_lang == 'erb' then
+            return vim.treesitter.query.get('ruby', 'endwise') ~= nil
+        end
+
         local ok, parser = pcall(vim.treesitter.get_parser, 0, nested_lang, { error = false })
         if not ok or not parser then
             return false
